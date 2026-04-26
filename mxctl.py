@@ -63,6 +63,20 @@ DEFAULT_CONFIG = {
     },
     "scroll_toggle_button": None,  # evdev code for scroll toggle, or null to use HID++ Smart Shift diversion
     "divert_smartshift": True,  # Divert the Smart Shift button via HID++ so we can intercept it
+
+    # Hold-and-swipe gestures (like Mac's 3-finger workspace swipe).
+    # Hold the gesture_button and swipe horizontally to fire a gesture.
+    # If you don't swipe (motion < threshold), the button's mapping in button_map
+    # fires as a regular tap.
+    "gesture_button": 277,  # evdev button code that activates gesture mode (thumb button)
+    "gesture_threshold": 80,  # accumulated px in a direction needed to trigger
+    "gestures": {
+        # direction -> list of keys to press together (chord)
+        "left":  ["KEY_LEFTCTRL", "KEY_LEFTALT", "KEY_LEFT"],   # workspace left
+        "right": ["KEY_LEFTCTRL", "KEY_LEFTALT", "KEY_RIGHT"],  # workspace right
+        "up":    [],   # leave empty to disable
+        "down":  []
+    }
 }
 
 CONFIG_PATH = Path("~/.config/mxctl/config.json").expanduser()
@@ -345,6 +359,33 @@ class MXController:
         if self.scroll_toggle_btn is not None:
             self.scroll_toggle_btn = int(self.scroll_toggle_btn)
 
+        # Gesture state
+        gb = config.get("gesture_button")
+        self.gesture_btn = int(gb) if gb is not None else None
+        self.gesture_threshold = int(config.get("gesture_threshold", 80))
+        self.gestures = {}
+        for direction, keys in (config.get("gestures") or {}).items():
+            if not keys:
+                continue
+            resolved = []
+            ok = True
+            for k in keys:
+                if isinstance(k, str):
+                    code = getattr(ecodes, k, None)
+                    if code is None:
+                        print(f"Warning: unknown key '{k}' in gesture '{direction}', skipping")
+                        ok = False
+                        break
+                    resolved.append(code)
+                else:
+                    resolved.append(int(k))
+            if ok:
+                self.gestures[direction] = resolved
+        self._gesture_active = False
+        self._gesture_dx = 0
+        self._gesture_dy = 0
+        self._gesture_fired = False
+
     def find_devices(self):
         """Discover and open required devices."""
         name_match = self.config.get("mouse_name_match", "Logitech USB Receiver Mouse")
@@ -393,6 +434,9 @@ class MXController:
         key_caps = set(caps.get(ecodes.EV_KEY, []))
         for target_code in self.button_map.values():
             key_caps.add(target_code)
+        for chord in self.gestures.values():
+            for code in chord:
+                key_caps.add(code)
 
         # Add KEY_HOMEPAGE and common keys we might want to map to
         for extra in [ecodes.KEY_HOMEPAGE, ecodes.KEY_BACK, ecodes.KEY_FORWARD,
@@ -498,15 +542,46 @@ class MXController:
             self.stop()
 
     def _handle_event(self, event):
-        """Process an input event, applying remapping."""
-        if event.type == ecodes.EV_KEY:
-            # Check if this is the scroll toggle button
-            if self.scroll_toggle_btn and event.code == self.scroll_toggle_btn:
-                if event.value == 1:  # Key down
-                    self.toggle_scroll_mode()
-                return  # Don't forward this button
+        """Process an input event, applying remapping and gestures."""
+        # Gesture: suppress motion while the gesture button is held
+        if self._gesture_active and event.type == ecodes.EV_REL:
+            if event.code == ecodes.REL_X:
+                self._gesture_dx += event.value
+                self._maybe_fire_gesture()
+                return
+            if event.code == ecodes.REL_Y:
+                self._gesture_dy += event.value
+                self._maybe_fire_gesture()
+                return
 
-            # Check button map
+        if event.type == ecodes.EV_KEY:
+            # Scroll toggle button
+            if self.scroll_toggle_btn and event.code == self.scroll_toggle_btn:
+                if event.value == 1:
+                    self.toggle_scroll_mode()
+                return
+
+            # Gesture button: enter/exit gesture mode
+            if self.gesture_btn is not None and event.code == self.gesture_btn and self.gestures:
+                if event.value == 1:  # press
+                    self._gesture_active = True
+                    self._gesture_dx = 0
+                    self._gesture_dy = 0
+                    self._gesture_fired = False
+                    return  # don't emit the mapped key yet
+                elif event.value == 0:  # release
+                    self._gesture_active = False
+                    if not self._gesture_fired:
+                        # No gesture triggered → treat as a tap, fire mapped key
+                        target = self.button_map.get(event.code)
+                        if target is not None:
+                            self.uinput.write(ecodes.EV_KEY, target, 1)
+                            self.uinput.syn()
+                            self.uinput.write(ecodes.EV_KEY, target, 0)
+                            self.uinput.syn()
+                    return
+
+            # Regular button mapping
             if event.code in self.button_map:
                 target = self.button_map[event.code]
                 self.uinput.write(ecodes.EV_KEY, target, event.value)
@@ -515,6 +590,33 @@ class MXController:
 
         # Forward unmodified event
         self.uinput.write(event.type, event.code, event.value)
+
+    def _maybe_fire_gesture(self):
+        """Check if accumulated motion crosses the threshold and fire a gesture chord."""
+        if self._gesture_fired:
+            return
+        adx = abs(self._gesture_dx)
+        ady = abs(self._gesture_dy)
+        if max(adx, ady) < self.gesture_threshold:
+            return
+
+        if adx >= ady:
+            direction = "right" if self._gesture_dx > 0 else "left"
+        else:
+            direction = "down" if self._gesture_dy > 0 else "up"
+
+        chord = self.gestures.get(direction)
+        if not chord:
+            return
+        # Press the chord, then release in reverse order
+        for code in chord:
+            self.uinput.write(ecodes.EV_KEY, code, 1)
+        self.uinput.syn()
+        for code in reversed(chord):
+            self.uinput.write(ecodes.EV_KEY, code, 0)
+        self.uinput.syn()
+        self._gesture_fired = True
+        print(f"Gesture: {direction}")
 
     def _handle_hidpp_notification(self, data):
         """Handle an HID++ notification from the device."""
